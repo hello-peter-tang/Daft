@@ -1,3 +1,4 @@
+mod cast;
 mod conversions;
 mod deserializer;
 #[cfg(feature = "python")]
@@ -679,6 +680,8 @@ impl Literal {
             || (combine_lit_types(&self.get_type(), dtype).as_ref() == Some(dtype))
         {
             Ok(self)
+        } else if let Some(casted) = cast::cast_literal(&self, dtype) {
+            casted
         } else {
             Series::from(self)
                 .cast(dtype)
