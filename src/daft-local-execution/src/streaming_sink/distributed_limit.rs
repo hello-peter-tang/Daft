@@ -71,7 +71,7 @@ impl StreamingSink for DistributedLimitSink {
 
                     let num_rows = input.len();
                     let iid = state.input_id.clone();
-                    let (skip, take, _done) = common_runtime::python::execute_python_coroutine::<
+                    let (skip, take, done) = common_runtime::python::execute_python_coroutine::<
                         _,
                         (i64, i64, bool),
                     >(move |py| {
@@ -85,16 +85,19 @@ impl StreamingSink for DistributedLimitSink {
                     debug_assert!(take >= 0, "actor returned negative take: {take}");
                     let skip = skip as usize;
                     let take = take as usize;
-                    let output = if take == 0 {
-                        MicroPartition::empty(Some(input.schema()))
-                    } else {
-                        input.slice(skip, skip + take)?
-                    };
+                    let output = (take > 0)
+                        .then(|| input.slice(skip, skip + take))
+                        .transpose()?;
 
-                    Ok((
-                        state,
-                        StreamingSinkOutput::NeedMoreInput(Some(output.into())),
-                    ))
+                    if done {
+                        // The actor reports that the global limit is satisfied, so stop
+                        // consuming this input instead of scanning the rest of the file.
+                        Ok((state, StreamingSinkOutput::Finished(output)))
+                    } else {
+                        let output =
+                            output.unwrap_or_else(|| MicroPartition::empty(Some(input.schema())));
+                        Ok((state, StreamingSinkOutput::NeedMoreInput(Some(output))))
+                    }
                 },
                 Span::current(),
             )
