@@ -170,3 +170,47 @@ def test_distributed_limit_retries_after_worker_death(tmp_path):
         "If 0 is missing, the limit actor failed to rewind the crashed "
         "task's claim in start_task."
     )
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
+def test_distributed_limit_stops_scanning_early(tmp_path):
+    """The sink must stop consuming its input once the global limit is satisfied.
+
+    Without early-stop, every scan task drains its whole input even though the
+    limit actor has no budget left, which is what makes
+    `read_parquet(...).where(...).limit(N)` slow over large datasets.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import daft
+    from daft import DataType, col
+    from daft.series import Series
+
+    rows_per_group = 5000
+    num_groups = 400
+    total_rows = rows_per_group * num_groups
+    path = tmp_path / "data.parquet"
+    with pq.ParquetWriter(path, pa.schema([("id", pa.int64())])) as writer:
+        for g in range(num_groups):
+            ids = pa.array(range(g * rows_per_group, (g + 1) * rows_per_group), type=pa.int64())
+            writer.write_table(pa.table({"id": ids}))
+
+    seen_file = tmp_path / "seen.log"
+
+    @daft.func.batch(return_dtype=DataType.bool())
+    def log_and_keep(s: Series) -> Series:
+        with open(seen_file, "ab", buffering=0) as f:
+            f.write(f"{len(s)}\n".encode())
+        return Series.from_pylist([True] * len(s))
+
+    # `.where` runs this UDF upstream of the distributed limit, so the log
+    # records how many rows the scan actually produced.
+    result = daft.read_parquet(str(path)).where(log_and_keep(col("id"))).limit(10).to_pydict()
+    assert len(result["id"]) == 10
+
+    seen = sum(int(line) for line in seen_file.read_text().splitlines() if line)
+    assert seen < total_rows // 2, (
+        f"distributed limit consumed {seen} of {total_rows} upstream rows; "
+        "it should stop after the limit is satisfied instead of draining the scan"
+    )
